@@ -1,5 +1,7 @@
 import logging
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from aiohttp import ClientResponse
@@ -11,8 +13,19 @@ from .message import JSONMessage, Message
 _LOGGER = logging.getLogger(__name__)
 
 
+# EcoFlow returns 8513 both for a bad access key and for one issued in another region
+PUBLIC_API_AUTH_ERROR_CODES = frozenset({"8513"})
+
+
 class EcoflowException(Exception):
-    pass
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        # EcoFlow's numeric error code, when the failure came from an API response
+        self.code = code
+
+
+class EcoflowAuthException(EcoflowException):
+    """Credentials were rejected - retrying with the same ones will not help."""
 
 
 @dataclass
@@ -31,6 +44,10 @@ class EcoflowApiClient(ABC):
         self.mqtt_info: EcoflowMqttInfo
         self.devices: dict[str, Any] = {}
         self.mqtt_client: EcoflowMQTTClient
+        self._mqtt_reconnect_last_attempt = 0.0
+        self._mqtt_reconnect_count = 0
+        # set by the integration, the only layer that can reach hass and the config entry
+        self.on_auth_failure: Callable[[], None] | None = None
 
     @abstractmethod
     async def login(self):
@@ -110,7 +127,11 @@ class EcoflowApiClient(ABC):
             raise EcoflowException(f"Failed to parse response: {resp.text} Error: {error}")
 
         if response_message.lower() != "success":
-            raise EcoflowException(f"{response_message}")
+            raw_code = json_resp.get("code")
+            code = None if raw_code is None else str(raw_code)
+            if code in PUBLIC_API_AUTH_ERROR_CODES:
+                raise EcoflowAuthException(f"{response_message}", code=code)
+            raise EcoflowException(f"{response_message}", code=code)
 
         return json_resp
 
@@ -132,6 +153,24 @@ class EcoflowApiClient(ABC):
         from custom_components.ecoflow_cloud.api.ecoflow_mqtt import EcoflowMQTTClient
 
         self.mqtt_client = EcoflowMQTTClient(self.mqtt_info, self.devices)
+        self.mqtt_client.on_auth_failure = self.on_auth_failure
+
+    def schedule_mqtt_reconnect(self, cooldown_sec: int = 60) -> int | None:
+        # reconnecting with rejected credentials only repeats the rejection
+        if self.mqtt_client.is_connected() or self.mqtt_client.auth_failed:
+            return None
+
+        now = time.monotonic()
+        if now - self._mqtt_reconnect_last_attempt < cooldown_sec:
+            return None
+
+        self._mqtt_reconnect_last_attempt = now
+        self._mqtt_reconnect_count += 1
+        return self._mqtt_reconnect_count
+
+    @property
+    def mqtt_reconnect_count(self) -> int:
+        return self._mqtt_reconnect_count
 
     def stop(self):
         _LOGGER.debug("Stopping MQTT client for %s", self.mqtt_info.client_id)

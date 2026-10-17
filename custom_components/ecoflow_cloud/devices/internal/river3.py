@@ -44,6 +44,7 @@ from custom_components.ecoflow_cloud.sensor import (
     OutWattsSensorEntity,
     QuotaStatusSensorEntity,
     RemainSensorEntity,
+    StateOfHealthSensorEntity,
     TempSensorEntity,
     VoltSensorEntity,
 )
@@ -202,7 +203,7 @@ class River3(BaseInternalDevice):
             CapacitySensorEntity(client, self, "bms_design_cap", const.MAIN_DESIGN_CAPACITY, False),
             CapacitySensorEntity(client, self, "bms_full_cap", const.MAIN_FULL_CAPACITY, False),
             CapacitySensorEntity(client, self, "bms_remain_cap", const.MAIN_REMAIN_CAPACITY, False),
-            LevelSensorEntity(client, self, "bms_batt_soh", const.SOH),
+            StateOfHealthSensorEntity(client, self, "bms_batt_soh", const.SOH),
             LevelSensorEntity(client, self, "cms_batt_soc", const.COMBINED_BATTERY_LEVEL),
             River3ChargingStateSensorEntity(client, self, "bms_chg_dsg_state", const.BATTERY_CHARGING_STATE),
             InWattsSensorEntity(client, self, "pow_in_sum_w", const.TOTAL_IN_POWER).with_energy(),
@@ -442,10 +443,23 @@ class River3(BaseInternalDevice):
             if not merged:
                 return super()._prepare_data(raw_data)
 
-            # River 3 firmware doesn't send cfg_ac_out_open directly;
-            # derive it from output_power_off_memory when available.
-            if "cfg_ac_out_open" not in merged and "output_power_off_memory" in merged:
-                merged["cfg_ac_out_open"] = 1 if merged["output_power_off_memory"] else 0
+            # River 3 firmware doesn't send cfg_ac_out_open directly. The
+            # live AC output state is carried by flow_info_ac_out instead
+            # (verified on a RIVER 3 Plus via MQTT/diagnostics: 2 == output
+            # on, 0 == output off, even with no load attached). Prefer that;
+            # fall back to the output_power_off_memory heuristic (the AC
+            # "always on" memory flag, which only approximates the real
+            # state) when flow_info_ac_out is absent. Both are skipped when
+            # the firmware sends cfg_ac_out_open directly, so that
+            # authoritative value -- like any SetReply -- always wins.
+            if "cfg_ac_out_open" not in merged:
+                ac_flow = merged.get("flow_info_ac_out")
+                if ac_flow in (0, 2):
+                    merged["cfg_ac_out_open"] = 1 if ac_flow == 2 else 0
+                elif ac_flow is None and "output_power_off_memory" in merged:
+                    merged["cfg_ac_out_open"] = (
+                        1 if merged["output_power_off_memory"] else 0
+                    )
 
             flat = self._flatten_dict(merged)
             return {"params": flat, "all_fields": merged}
